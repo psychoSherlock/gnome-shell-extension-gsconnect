@@ -6,6 +6,7 @@ import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Gtk from 'gi://Gtk';
 
 import * as Components from '../components/index.js';
 import * as Core from '../core.js';
@@ -32,6 +33,15 @@ export const Metadata = {
             parameter_type: null,
             incoming: ['kdeconnect.telephony'],
             outgoing: ['kdeconnect.telephony.request_mute'],
+        },
+        scrcpyDialog: {
+            // TRANSLATORS: Mirror the phone screen with scrcpy
+            label: _('Screen Share (scrcpy)'),
+            icon_name: 'video-display-symbolic',
+
+            parameter_type: null,
+            incoming: ['kdeconnect.telephony'],
+            outgoing: [],
         },
     },
 };
@@ -160,6 +170,7 @@ const TelephonyPlugin = GObject.registerClass({
         else if (packet.body.phoneNumber)
             sender = packet.body.phoneNumber;
 
+        this._pending?.delete(`${packet.body.event}|${sender}`);
         this.device.hideNotification(`${packet.body.event}|${sender}`);
         this._restoreMediaState();
     }
@@ -209,14 +220,165 @@ const TelephonyPlugin = GObject.registerClass({
             body = _('Ongoing call');
         }
 
-        this.device.showNotification({
-            id: `${packet.body.event}|${sender}`,
+        const id = `${packet.body.event}|${sender}`;
+        const params = {
+            id: id,
             title: sender,
             body: body,
             icon: icon,
             priority: priority,
             buttons: buttons,
+        };
+
+        // Only offer screen sharing if an ADB device is connected. The check
+        // is asynchronous and falls back to the plain notification.
+        this._pending ??= new Set();
+        this._pending.add(id);
+
+        this._getAdbSerial().then(serial => {
+            if (!this._pending?.delete(id))
+                return; // cancelled while checking
+
+            if (serial !== null) {
+                this._adbSerial = serial;
+                params.action = {name: 'scrcpyDialog', parameter: null};
+                params.buttons = [...buttons, {
+                    action: 'scrcpyDialog',
+                    label: _('Screen Share'),
+                    parameter: null,
+                }];
+            }
+
+            this.device.showNotification(params);
+        }).catch(e => {
+            logError(e);
+            if (this._pending?.delete(id))
+                this.device.showNotification(params);
         });
+    }
+
+    /**
+     * Resolve the serial of the first connected ADB device (USB or wireless),
+     * or null if there is none, adb is missing or the check times out.
+     *
+     * @returns {Promise<string|null>} A device serial or null
+     */
+    async _getAdbSerial() {
+        try {
+            const proc = new Gio.Subprocess({
+                argv: ['adb', 'devices'],
+                flags: Gio.SubprocessFlags.STDOUT_PIPE |
+                       Gio.SubprocessFlags.STDERR_SILENCE,
+            });
+            proc.init(null);
+
+            const cancellable = new Gio.Cancellable();
+            const timeout = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => {
+                cancellable.cancel();
+                proc.force_exit();
+                return GLib.SOURCE_REMOVE;
+            });
+
+            let stdout;
+            try {
+                [stdout] = await proc.communicate_utf8_async(null, cancellable);
+            } finally {
+                GLib.source_remove(timeout);
+            }
+
+            for (const line of (stdout ?? '').split('\n')) {
+                const [serial, state] = line.trim().split(/\s+/);
+
+                if (state === 'device')
+                    return serial;
+            }
+        } catch (e) {
+            // adb not installed, timed out, etc.
+        }
+
+        return null;
+    }
+
+    _findScrcpy() {
+        // Prefer a user-installed build (matches what the shell alias runs)
+        // over the system one, which may render without window decorations.
+        const home = GLib.get_home_dir();
+        const candidates = [
+            GLib.build_filenamev([home, 'bin', 'scrcpy_dir', 'scrcpy']),
+            GLib.build_filenamev([home, '.local', 'bin', 'scrcpy']),
+        ];
+
+        return candidates.find(path =>
+            GLib.file_test(path, GLib.FileTest.IS_EXECUTABLE)) ??
+            GLib.find_program_in_path('scrcpy');
+    }
+
+    /**
+     * Ask whether to start screen sharing, with an audio toggle.
+     */
+    scrcpyDialog() {
+        if (this._scrcpyDialog) {
+            this._scrcpyDialog.present();
+            return;
+        }
+
+        const dialog = new Gtk.MessageDialog({
+            message_type: Gtk.MessageType.QUESTION,
+            text: _('Start screen share?'),
+            secondary_text: _('Mirror %s with scrcpy.').format(this.device.name),
+            modal: false,
+            urgency_hint: true,
+        });
+        dialog.add_button(_('Cancel'), Gtk.ResponseType.CANCEL);
+        dialog.add_button(_('Start'), Gtk.ResponseType.OK);
+        dialog.set_default_response(Gtk.ResponseType.OK);
+
+        const row = new Gtk.Box({spacing: 12, margin_top: 6});
+        row.pack_start(new Gtk.Label({label: _('Audio'), hexpand: true, xalign: 0}), true, true, 0);
+        const audio = new Gtk.Switch({active: false, valign: Gtk.Align.CENTER});
+        row.pack_end(audio, false, false, 0);
+        dialog.get_message_area().pack_start(row, false, false, 0);
+        row.show_all();
+
+        dialog.connect('response', (_dialog, response) => {
+            const withAudio = audio.active;
+            dialog.destroy();
+            this._scrcpyDialog = null;
+
+            if (response === Gtk.ResponseType.OK)
+                this._startScrcpy(withAudio);
+        });
+
+        this._scrcpyDialog = dialog;
+        dialog.set_keep_above(true);
+        dialog.present();
+    }
+
+    _startScrcpy(withAudio) {
+        try {
+            const scrcpy = this._findScrcpy();
+
+            if (scrcpy === null)
+                throw new Error('scrcpy not found');
+
+            const argv = [scrcpy];
+
+            if (this._adbSerial)
+                argv.push('-s', this._adbSerial);
+
+            if (!withAudio)
+                argv.push('--no-audio');
+
+            Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
+        } catch (e) {
+            logError(e, 'GSConnect: failed to start scrcpy');
+            this.device.showNotification({
+                id: 'scrcpy-error',
+                title: _('Screen Share'),
+                body: _('Could not start scrcpy'),
+                icon: new Gio.ThemedIcon({name: 'dialog-error-symbolic'}),
+            });
+        }
     }
 
     /**
@@ -233,6 +395,9 @@ const TelephonyPlugin = GObject.registerClass({
     }
 
     destroy() {
+        this._pending?.clear();
+        this._scrcpyDialog?.destroy();
+
         if (this._mixer !== undefined)
             this._mixer = Components.release('pulseaudio');
 
