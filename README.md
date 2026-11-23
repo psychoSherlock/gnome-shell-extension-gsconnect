@@ -30,6 +30,34 @@ With GSConnect you can securely connect to mobile devices and other desktops to:
 Please see the **[Wiki][wiki]** for more information about
 **[Features][features]** and **[Help][help]**.
 
+## Fork changes: scrcpy screen share on incoming calls
+
+This is a personal fork of GSConnect (based on v74) that adds one feature to
+the Telephony plugin. All changes are in `src/service/plugins/telephony.js` on
+the `scrcpy-on-call` branch; nothing else is modified.
+
+When a call rings (or is ongoing) **and an ADB device is connected** (USB or
+wireless), the call notification gains:
+
+* A **Screen Share** button next to **Mute**
+* A default click action: clicking the notification opens a dialog with
+  **Start** and **Cancel** buttons and an **Audio** switch (off by default,
+  which runs scrcpy with `--no-audio`)
+
+**Start** launches `scrcpy -s <serial>` for the connected device. If no ADB
+device is connected, adb is missing, or the check takes longer than 3 seconds,
+the notification is exactly the same as upstream.
+
+Requirements: `adb` on your `PATH` and `scrcpy` installed. scrcpy is looked up
+at `~/bin/scrcpy_dir/scrcpy`, then `~/.local/bin/scrcpy`, then on your `PATH`.
+A user-installed build is preferred because some system builds (e.g. SDL3) draw
+the window without a title bar on Wayland.
+
+To try it, copy `src/service/plugins/telephony.js` over the same file in your
+installed extension
+(`~/.local/share/gnome-shell/extensions/gsconnect@andyholmes.github.io/service/plugins/`)
+and restart the GSConnect service. Back up the original first.
+
 ## Project Status
 
 GSConnect is now under the GitHub organisation [GSConnect][gsconnect-org].
